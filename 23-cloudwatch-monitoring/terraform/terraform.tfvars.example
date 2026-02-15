@@ -1,0 +1,3 @@
+aws_region  = "ap-south-2"
+alarm_email = "your-email@example.com"
+# instance_id = "i-0123456789abcdef0"  # Optional: provide EC2 instance ID to monitor

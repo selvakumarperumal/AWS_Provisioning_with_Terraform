@@ -1,0 +1,9 @@
+output "nat_gateway_id" {
+  description = "The ID of the NAT Gateway"
+  value       = aws_nat_gateway.nat.id
+}
+
+output "nat_eip" {
+  description = "The Elastic IP of the NAT Gateway"
+  value       = aws_eip.nat.public_ip
+}

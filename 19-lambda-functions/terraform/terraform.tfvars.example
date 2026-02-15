@@ -1,0 +1,2 @@
+aws_region    = "ap-south-2"
+function_name = "hello-lambda"

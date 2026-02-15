@@ -1,2 +1,0 @@
-aws_region   = "YOUR_AWS_REGION"
-vpc_cidr   = "YOUR_VPC_CIDR"

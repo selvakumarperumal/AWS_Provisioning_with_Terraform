@@ -1,6 +1,0 @@
-aws_region   = "YOUR_AWS_REGION"
-vpc_cidr   = "YOUR_VPC_CIDR"
-subnet_cidr  = "YOUR_SUBNET_CIDR"
-ami_id       = "YOUR_AMI_ID"
-instance_type = "YOUR_INSTANCE_TYPE"
-key_name     = "YOUR_KEY_NAME"

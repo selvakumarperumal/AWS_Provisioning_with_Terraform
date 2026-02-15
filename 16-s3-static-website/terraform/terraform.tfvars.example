@@ -1,0 +1,2 @@
+aws_region  = "ap-south-2"
+bucket_name = "my-unique-website-bucket-12345"

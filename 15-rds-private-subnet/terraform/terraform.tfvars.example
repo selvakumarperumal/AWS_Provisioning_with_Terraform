@@ -1,0 +1,12 @@
+aws_region           = "ap-south-2"
+vpc_cidr             = "10.0.0.0/16"
+public_subnet_cidrs  = ["10.0.1.0/24", "10.0.2.0/24"]
+private_subnet_cidrs = ["10.0.3.0/24", "10.0.4.0/24"]
+availability_zones   = ["ap-south-2a", "ap-south-2b"]
+db_identifier        = "myapp-database"
+db_instance_class    = "db.t3.micro"
+db_storage           = 20
+db_name              = "myappdb"
+db_username          = "admin"
+db_password          = "ChangeMe123!"   # Use secrets manager in production!
+multi_az             = false

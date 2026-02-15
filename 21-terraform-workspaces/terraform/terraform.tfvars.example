@@ -1,0 +1,8 @@
+aws_region = "ap-south-2"
+
+# Usage:
+#   terraform workspace new dev
+#   terraform workspace new staging
+#   terraform workspace new prod
+#   terraform workspace select dev
+#   terraform apply
