@@ -16,32 +16,23 @@ The internet only understands **public IP addresses**. Private IPs like `10.x.x.
 
 ```mermaid
 graph LR
-    subgraph Your_VPC["Your VPC"]
-        DB["🗄️ DB Server\n10.0.2.50\n(Private IP only)"]
-    end
-
-    subgraph Internet_Routers["🌐 Internet Routers"]
-        R1["Router 1"]
-        R2["Router 2"]
-        R3["Router 3"]
-    end
-
-    Ubuntu["📦 Ubuntu Servers\n91.189.91.39"]
-
-    DB -->|"Packet: src=10.0.2.50\ndst=91.189.91.39"| R1
-    R1 -->|"❌ DROP!\nsrc 10.0.2.50 is private\nI don't know how to\nroute reply back"| R2
-    R2 -.-x R3
-    R3 -.-x Ubuntu
+    DB["DB Server\n10.0.2.50"] -->|"src=10.0.2.50"| R1["Internet\nRouter"]
+    R1 -->|"❌ DROPPED"| X["10.0.2.50 is private\nCan't route back"]
 
     style DB fill:#dd3522,color:#fff
-    style R1 fill:#ff9900,color:#000
+    style X fill:#ffcdd2
 ```
 
-**Even if the packet somehow reached Ubuntu's servers, the reply would go to `10.0.2.50` — but the internet has no idea where `10.0.2.50` is!** Millions of private networks use `10.0.2.50` internally. The internet can't route to it.
+Here's why this fails:
+
+1. **Your DB server** creates a packet with source IP `10.0.2.50` and sends it to `91.189.91.39` (Ubuntu servers)
+2. **Internet routers** see the source is `10.0.2.50` — a private IP — and **drop the packet**
+3. Even if the packet somehow reached Ubuntu, the reply would be sent to `10.0.2.50` — but **the internet has no idea where that is**. Millions of private networks use `10.0.2.50` internally. There's no way to route back.
+4. **Result:** Connection timeout. Nothing works.
 
 ### The Solution: Someone with a Public IP Must Speak on Behalf of the Private Instance
 
-That "someone" is the **NAT Gateway**. It has a **public IP (Elastic IP)** that the internet CAN route to.
+That "someone" is the **NAT Gateway**. It has a **public IP (Elastic IP)** that the internet CAN route to. The NAT Gateway takes your private instance's packet, **replaces the private source IP with its own public IP**, and sends it out. When the reply comes back to the public IP, NAT translates it back and delivers it to your private instance.
 
 ---
 
@@ -50,30 +41,27 @@ That "someone" is the **NAT Gateway**. It has a **public IP (Elastic IP)** that 
 Imagine you live in a gated community (private subnet) with no street address visible from outside. You want to order something online, but the delivery truck can't find your house.
 
 ```mermaid
-graph TB
-    subgraph Gated_Community["🏘️ Gated Community (Private Subnet)\nNo street address visible from outside"]
-        You["🏠 You (DB Server)\nInternal address: House #50\n(10.0.2.50)"]
-    end
+graph LR
+    You["🏠 House #50"] -->|"① Send letter"| PO["📮 PO Box 206"]
+    PO -->|"② Forward with PO address"| Store["📦 Store"]
+    Store -->|"③ Reply to PO Box 206"| PO
+    PO -->|"④ Deliver to House #50"| You
 
-    subgraph Post_Office["📮 Post Office Box (NAT Gateway)\nLocated OUTSIDE the gate\nPublic address: PO Box 206\n(EIP: 15.206.x.x)"]
-        PO["📬 PO Box 206"]
-    end
+    Store -.-x|"❌ Can't find House #50"| You
 
-    subgraph Outside["🌐 Online Store (Internet)"]
-        Store["📦 Amazon / Ubuntu Repos"]
-    end
-
-    You -->|"① You drop your letter at the PO Box\n(packet goes to NAT)"| PO
-    PO -->|"② PO Box sends with return address: PO Box 206\n(NAT replaces your IP with EIP)"| Store
-    Store -->|"③ Store ships to PO Box 206\n(reply goes to NAT's EIP)"| PO
-    PO -->|"④ Post office delivers to House #50\n(NAT puts your IP back)"| You
-
-    Store --x|"❌ Store doesn't know House #50 exists\nCan't deliver directly"| You
-
-    style Gated_Community fill:#dd3522,color:#fff
-    style Post_Office fill:#3b48cc,color:#fff
-    style Outside fill:#1a8f1a,color:#fff
+    style You fill:#dd3522,color:#fff
+    style PO fill:#3b48cc,color:#fff
+    style Store fill:#1a8f1a,color:#fff
 ```
+
+How the analogy maps:
+
+1. **You (House #50)** want to order something online, but your house has no visible street address from outside the gate
+2. **You drop your order at the PO Box** — your DB server sends a packet to the NAT Gateway
+3. **The PO Box sends it out using its own public address** (PO Box 206) — NAT replaces your private IP with its Elastic IP
+4. **The store ships the package to PO Box 206** — the internet sends the reply to NAT's public IP
+5. **The post office delivers it to House #50** — NAT translates the destination back to your private IP and delivers it
+6. **The store never knows House #50 exists** — the internet never sees your private IP
 
 | Analogy | AWS Equivalent |
 |---------|----------------|
@@ -90,64 +78,74 @@ graph TB
 
 ## How a Private Machine Reaches the Internet (The Full Picture)
 
-Here's the **complete path** when a database server in a private subnet runs `sudo apt-get update`:
+Here's the **complete path** when a database server in a private subnet runs `sudo apt-get update`.
+
+### The Outbound Journey (Private Instance → Internet)
 
 ```mermaid
-graph TB
-    subgraph VPC["🏗️ VPC (10.0.0.0/16)"]
-        subgraph Private["🔴 Private Subnet (10.0.2.0/24)"]
-            DB["🗄️ DB Server\nIP: 10.0.2.50\n❌ No public IP\n❌ No direct internet"]
-        end
-
-        PrivRT["📋 Private Route Table\n━━━━━━━━━━━━━━━━━━━━━━━━\n10.0.0.0/16 → local\n0.0.0.0/0 → nat-gw-xxx ← this is the key!"]
-
-        subgraph Public["🟢 Public Subnet (10.0.1.0/24)"]
-            NAT["🔄 NAT Gateway\nPrivate IP: 10.0.1.100\nElastic IP: 15.206.x.x\n━━━━━━━━━━━━━━━━━━━━━━━━\n① Receives packet from DB\n② Replaces src IP with EIP\n③ Remembers the mapping\n④ Forwards to internet"]
-        end
-
-        PubRT["📋 Public Route Table\n━━━━━━━━━━━━━━━━━━━━━━━━\n10.0.0.0/16 → local\n0.0.0.0/0 → igw-xxx"]
-
-        IGW["🚪 Internet Gateway\n━━━━━━━━━━━━━━━━━━━━━━━━\nBridge between VPC and Internet\nFREE | AWS Managed"]
-    end
-
-    Internet["🌐 Internet\n(apt repos, PyPI, npm, Docker Hub, GitHub...)"]
-
-    DB -->|"Step 1️⃣\napt-get update\nsrc=10.0.2.50"| PrivRT
-    PrivRT -->|"Step 2️⃣\n0.0.0.0/0 → NAT GW"| NAT
-    NAT -->|"Step 3️⃣\nsrc changed to 15.206.x.x"| PubRT
-    PubRT -->|"Step 4️⃣\n0.0.0.0/0 → IGW"| IGW
-    IGW -->|"Step 5️⃣\nPacket exits AWS"| Internet
-
-    Internet -->|"Step 6️⃣\nReply to 15.206.x.x"| IGW
-    IGW -->|"Step 7️⃣\nDeliver to NAT (EIP owner)"| NAT
-    NAT -->|"Step 8️⃣\ndst changed back to 10.0.2.50"| PrivRT
-    PrivRT -->|"Step 9️⃣\nDeliver to DB server"| DB
+graph LR
+    DB["DB Server\n10.0.2.50"] --> PrivRT["Private RT"]
+    PrivRT --> NAT["NAT GW\n15.206.x.x"]
+    NAT --> PubRT["Public RT"]
+    PubRT --> IGW["IGW"]
+    IGW --> Internet["Internet"]
 
     style DB fill:#dd3522,color:#fff
-    style Private fill:#ffcdd2
     style NAT fill:#3b48cc,color:#fff
-    style Public fill:#c8e6c9
     style IGW fill:#ff9900,color:#000
     style Internet fill:#232f3e,color:#fff
-    style PrivRT fill:#e3f2fd
-    style PubRT fill:#e3f2fd
 ```
 
-### Breaking Down Each Step
+**Step-by-step explanation:**
 
-| Step | Where | What Happens | Packet Source → Dest |
-|------|-------|-------------|---------------------|
-| 1️⃣ | DB Server | App runs `apt-get update`, OS creates packet | `10.0.2.50 → 91.189.91.39` |
-| 2️⃣ | Private Route Table | Looks up route: `91.189.91.39` matches `0.0.0.0/0 → NAT GW` | `10.0.2.50 → 91.189.91.39` |
-| 3️⃣ | NAT Gateway | **SNAT**: replaces source with Elastic IP, saves mapping | `15.206.x.x → 91.189.91.39` |
-| 4️⃣ | Public Route Table | Looks up route: `91.189.91.39` matches `0.0.0.0/0 → IGW` | `15.206.x.x → 91.189.91.39` |
-| 5️⃣ | Internet Gateway | Sends packet to the internet | `15.206.x.x → 91.189.91.39` |
-| 6️⃣ | Ubuntu Server | Sends response back to the EIP | `91.189.91.39 → 15.206.x.x` |
-| 7️⃣ | Internet Gateway | Routes to NAT GW (it owns the EIP) | `91.189.91.39 → 15.206.x.x` |
-| 8️⃣ | NAT Gateway | **DNAT**: looks up mapping, restores original dest IP | `91.189.91.39 → 10.0.2.50` |
-| 9️⃣ | Private Route Table | `10.0.2.50` matches `10.0.0.0/16 → local`, delivers | `91.189.91.39 → 10.0.2.50` |
+**Step 1 — DB Server creates the packet.** Your database server runs `apt-get update`. The operating system creates a network packet with source IP `10.0.2.50` (the DB server's private IP) and destination IP `91.189.91.39` (Ubuntu's package server). At this point the packet looks like: `src=10.0.2.50, dst=91.189.91.39`.
 
-> **Key takeaway:** The DB server's private IP (`10.0.2.50`) **never leaves the VPC**. The internet only ever sees the NAT Gateway's Elastic IP (`15.206.x.x`).
+**Step 2 — Private Route Table finds the route.** The packet reaches the private subnet's route table. It checks: is `91.189.91.39` within `10.0.0.0/16`? No, it's not. So it falls through to the default route `0.0.0.0/0 → nat-gw-xxx`. The route table forwards the packet to the NAT Gateway.
+
+**Step 3 — NAT Gateway performs SNAT (Source NAT).** This is the critical step. The NAT Gateway **replaces the source IP** from the private IP (`10.0.2.50`) to its own Elastic IP (`15.206.x.x`). It also saves a mapping in its internal connection tracking table so it can reverse this later. Now the packet looks like: `src=15.206.x.x, dst=91.189.91.39`.
+
+**Step 4 — Public Route Table routes to IGW.** The NAT Gateway sits in the public subnet. That subnet's route table has `0.0.0.0/0 → igw-xxx`, so the packet is forwarded to the Internet Gateway.
+
+**Step 5 — Internet Gateway sends it to the internet.** The IGW is the door to the outside world. The packet exits AWS and travels across the internet to Ubuntu's servers at `91.189.91.39`.
+
+### The Return Journey (Internet → Private Instance)
+
+```mermaid
+graph RL
+    Internet["Internet"] --> IGW["IGW"]
+    IGW --> NAT["NAT GW\n15.206.x.x"]
+    NAT --> PrivRT["Private RT"]
+    PrivRT --> DB["DB Server\n10.0.2.50"]
+
+    style DB fill:#dd3522,color:#fff
+    style NAT fill:#3b48cc,color:#fff
+    style IGW fill:#ff9900,color:#000
+    style Internet fill:#232f3e,color:#fff
+```
+
+**Step 6 — Ubuntu server responds.** The Ubuntu server processes the request and sends a response back to `15.206.x.x` (the NAT Gateway's Elastic IP). It has **no idea** that the real requester is `10.0.2.50`.
+
+**Step 7 — Internet Gateway delivers to NAT.** The IGW receives the reply and knows that `15.206.x.x` belongs to the NAT Gateway's network interface (ENI), so it delivers the packet there.
+
+**Step 8 — NAT Gateway performs DNAT (Destination NAT).** The NAT Gateway looks up its connection tracking table: "port 43210 on 15.206.x.x maps to 10.0.2.50:43210". It **replaces the destination IP** from `15.206.x.x` back to `10.0.2.50`. Now the packet looks like: `src=91.189.91.39, dst=10.0.2.50`.
+
+**Step 9 — Private Route Table delivers locally.** The private route table sees destination `10.0.2.50` matches `10.0.0.0/16 → local`. The packet is delivered to the DB server. **apt-get update succeeds!**
+
+### How the Packet IP Changes at Each Hop
+
+| Step | Location | Source IP | Dest IP | What Changed? |
+|------|----------|-----------|---------|---------------|
+| 1 | DB Server creates packet | `10.0.2.50` | `91.189.91.39` | Original packet |
+| 2 | Private Route Table | `10.0.2.50` | `91.189.91.39` | Nothing (just routing) |
+| 3 | **NAT Gateway (SNAT)** | **`15.206.x.x`** | `91.189.91.39` | **Source IP replaced!** |
+| 4 | Public Route Table | `15.206.x.x` | `91.189.91.39` | Nothing (just routing) |
+| 5 | IGW → Internet | `15.206.x.x` | `91.189.91.39` | Packet exits AWS |
+| 6 | Ubuntu responds | `91.189.91.39` | `15.206.x.x` | Response created |
+| 7 | IGW → NAT | `91.189.91.39` | `15.206.x.x` | Nothing (just routing) |
+| 8 | **NAT Gateway (DNAT)** | `91.189.91.39` | **`10.0.2.50`** | **Dest IP restored!** |
+| 9 | Private RT → DB Server | `91.189.91.39` | `10.0.2.50` | Delivered! |
+
+> **Key takeaway:** The DB server's private IP (`10.0.2.50`) **never leaves the VPC**. The internet only ever sees the NAT Gateway's Elastic IP (`15.206.x.x`). This is what makes private instances protected — they are invisible to the outside world.
 
 ---
 
@@ -155,38 +153,36 @@ graph TB
 
 The NAT Gateway maintains an internal **connection tracking table** — this is how it knows which return packets belong to which private instance.
 
+When your DB server sends a packet, the NAT Gateway records the mapping: "this private IP and port maps to this public IP and port". When the reply comes back, NAT looks up the table to find the original sender.
+
 ```mermaid
-graph TD
-    subgraph NAT_Table["🔄 NAT Gateway — Connection Tracking Table"]
-        direction TB
-        Header["Internal IP:Port ↔ External IP:Port | Destination | Status"]
-        Row1["10.0.2.50:43210 ↔ 15.206.x.x:43210 | apt.ubuntu.com:443 | ACTIVE"]
-        Row2["10.0.2.100:51234 ↔ 15.206.x.x:51234 | api.github.com:443 | ACTIVE"]
-        Row3["10.0.2.100:49876 ↔ 15.206.x.x:49876 | pypi.org:443 | ACTIVE"]
-        Row4["10.0.2.75:60001 ↔ 15.206.x.x:60001 | registry.npmjs.org:443 | IDLE"]
-    end
+graph LR
+    DB2["DB Server\n10.0.2.50"] --> NAT2["NAT GW\n15.206.x.x"]
+    App2["App Server\n10.0.2.100"] --> NAT2
+    NAT2 --> Internet3["Internet"]
 
-    DB2["🗄️ DB Server\n10.0.2.50"] -->|"Creates Row 1"| NAT_Table
-    App2["⚙️ App Server\n10.0.2.100"] -->|"Creates Rows 2 & 3"| NAT_Table
-    Worker["🔧 Worker\n10.0.2.75"] -->|"Creates Row 4"| NAT_Table
-
-    NAT_Table -->|"All outbound traffic\nappears as 15.206.x.x"| Internet3["🌐 Internet"]
-    Internet3 -->|"Return traffic to\n15.206.x.x:43210"| NAT_Table
-    NAT_Table -->|"Lookup: 43210 → 10.0.2.50\nDeliver to DB Server"| DB2
-
-    style NAT_Table fill:#e8eaf6
     style DB2 fill:#dd3522,color:#fff
     style App2 fill:#ff9900,color:#000
-    style Worker fill:#1a8f1a,color:#fff
+    style NAT2 fill:#3b48cc,color:#fff
 ```
+
+**Connection tracking table inside the NAT Gateway:**
+
+| # | Private Instance | Port | NAT Public IP | Port | Destination | Status |
+|---|-----------------|------|---------------|------|-------------|--------|
+| 1 | 10.0.2.50 | 43210 | 15.206.x.x | 43210 | apt.ubuntu.com:443 | ACTIVE |
+| 2 | 10.0.2.100 | 51234 | 15.206.x.x | 51234 | api.github.com:443 | ACTIVE |
+| 3 | 10.0.2.100 | 49876 | 15.206.x.x | 49876 | pypi.org:443 | ACTIVE |
+| 4 | 10.0.2.75 | 60001 | 15.206.x.x | 60001 | registry.npmjs.org:443 | IDLE |
 
 **How multiple private instances share ONE public IP:**
 
 1. **DB Server** (`10.0.2.50`) sends a packet using source port `43210`
 2. **App Server** (`10.0.2.100`) sends a packet using source port `51234`
-3. Both packets leave the NAT Gateway as `15.206.x.x` but with **different ports**
-4. When replies come back, NAT checks the **port number** to figure out which internal server to deliver to
-5. This is called **PAT (Port Address Translation)** — many private IPs share one public IP using different ports
+3. Both packets leave the NAT Gateway as `15.206.x.x` but with **different port numbers**
+4. When a reply comes back to `15.206.x.x:43210`, NAT looks up port `43210` in the table → it belongs to `10.0.2.50` → deliver there
+5. When a reply comes back to `15.206.x.x:51234`, NAT looks up port `51234` in the table → it belongs to `10.0.2.100` → deliver there
+6. This technique is called **PAT (Port Address Translation)** — many private IPs share one public IP using different ports
 
 > **Capacity:** A single NAT Gateway supports up to **55,000 simultaneous connections** to each unique destination. If you need more, use multiple NAT Gateways.
 
@@ -198,26 +194,26 @@ The **entire difference** between a public and private subnet comes down to **on
 
 ```mermaid
 graph TB
-    subgraph VPC_RT["VPC (10.0.0.0/16)"]
-        subgraph PubRT2["📋 PUBLIC Subnet Route Table"]
-            PR1["10.0.0.0/16 → local (same in both)"]
-            PR2["0.0.0.0/0 → igw-xxx\n━━━━━━━━━━━━━━━━━━━━━━━━\n↑ THIS makes it PUBLIC\nTraffic goes directly to Internet Gateway\n= Bidirectional internet access"]
-        end
-
-        subgraph PrivRT2["📋 PRIVATE Subnet Route Table"]
-            PP1["10.0.0.0/16 → local (same in both)"]
-            PP2["0.0.0.0/0 → nat-gw-xxx\n━━━━━━━━━━━━━━━━━━━━━━━━\n↑ THIS makes it PRIVATE\nTraffic goes through NAT Gateway first\n= Outbound only internet access"]
-        end
+    subgraph PubRT2["Public Route Table"]
+        PR1["10.0.0.0/16 → local"]
+        PR2["0.0.0.0/0 → IGW"]
     end
 
-    PubRT2 -->|"Associated with"| PubSub2["🟢 Public Subnet\nInstances CAN be reached from internet"]
-    PrivRT2 -->|"Associated with"| PrivSub2["🔴 Private Subnet\nInstances CANNOT be reached from internet"]
+    subgraph PrivRT2["Private Route Table"]
+        PP1["10.0.0.0/16 → local"]
+        PP2["0.0.0.0/0 → NAT GW"]
+    end
+
+    PubRT2 --> PubSub2["🟢 Public Subnet"]
+    PrivRT2 --> PrivSub2["🔴 Private Subnet"]
 
     style PubRT2 fill:#c8e6c9
     style PrivRT2 fill:#ffcdd2
     style PubSub2 fill:#1a8f1a,color:#fff
     style PrivSub2 fill:#dd3522,color:#fff
 ```
+
+Notice the only difference is **one line**: the default route (`0.0.0.0/0`). In the public route table, it points to the **IGW** (direct, bidirectional internet access). In the private route table, it points to the **NAT Gateway** (outbound only, through NAT translation).
 
 | | Public Subnet RT | Private Subnet RT |
 |--|-------------------|--------------------|
@@ -233,44 +229,44 @@ graph TB
 
 ```mermaid
 graph TB
-    Internet["🌐 Internet<br/>(apt repos, APIs, etc.)"]
+    Internet["🌐 Internet"]
 
-    subgraph AWS["☁️ AWS Cloud"]
-        subgraph VPC["🏗️ VPC (10.0.0.0/16)"]
-            IGW["🚪 Internet Gateway"]
+    subgraph VPC["VPC (10.0.0.0/16)"]
+        IGW["Internet Gateway"]
 
-            subgraph AZ_A["📍 AZ: ap-south-2a"]
-                PubSub["🟢 Public Subnet<br/>10.0.1.0/24"]
-                NAT["🔄 NAT Gateway<br/>━━━━━━━━━━━━━━━━━<br/>Elastic IP: 15.206.x.x<br/>Placed in PUBLIC subnet<br/>Enables OUTBOUND only"]
-            end
-
-            subgraph AZ_B["📍 AZ: ap-south-2b"]
-                PrivSub["🔴 Private Subnet<br/>10.0.2.0/24"]
-                DB["🗄️ Database Server<br/>10.0.2.50"]
-                App["⚙️ App Server<br/>10.0.2.100"]
-            end
-
-            PubRT["📋 Public Route Table<br/>0.0.0.0/0 → IGW"]
-            PrivRT["📋 Private Route Table<br/>0.0.0.0/0 → NAT Gateway"]
+        subgraph AZ_A["Public Subnet (10.0.1.0/24)"]
+            NAT["NAT Gateway\nEIP: 15.206.x.x"]
         end
+
+        subgraph AZ_B["Private Subnet (10.0.2.0/24)"]
+            DB["DB Server 10.0.2.50"]
+            App["App Server 10.0.2.100"]
+        end
+
+        PubRT["Public RT: 0.0.0.0/0 → IGW"]
+        PrivRT["Private RT: 0.0.0.0/0 → NAT"]
     end
 
-    Internet <-->|"Bidirectional"| IGW
-    IGW --> PubRT --> PubSub
-    PubSub --- NAT
-    NAT -.->|"Outbound via"| IGW
-    PrivRT --> PrivSub
-    DB -->|"apt-get update"| PrivRT
-    App -->|"API calls"| PrivRT
-
-    Internet --x|"❌ BLOCKED<br/>Cannot initiate"| PrivSub
+    Internet <--> IGW
+    IGW --- PubRT --> NAT
+    DB --> PrivRT --> NAT
+    App --> PrivRT
+    NAT -.-> IGW
+    Internet --x|"❌ BLOCKED"| AZ_B
 
     style IGW fill:#ff9900,color:#000
     style NAT fill:#3b48cc,color:#fff
-    style PubSub fill:#1a8f1a,color:#fff
-    style PrivSub fill:#dd3522,color:#fff
+    style AZ_A fill:#c8e6c9
+    style AZ_B fill:#ffcdd2
     style VPC fill:#232f3e,color:#fff
 ```
+
+Key things to notice in this architecture:
+
+- **NAT Gateway sits in the PUBLIC subnet** — it needs the IGW route to reach the internet
+- **Private instances route through NAT** — their route table says `0.0.0.0/0 → NAT Gateway`
+- **The NAT Gateway then uses the IGW** — because it's in the public subnet, which has `0.0.0.0/0 → IGW`
+- **Inbound is blocked** — nobody on the internet can initiate a connection to the private subnet
 
 ---
 
@@ -278,57 +274,59 @@ graph TB
 
 ### Complete Traffic Flow
 
+Let's trace what happens when a DB server (`10.0.2.50`) in a private subnet tries to reach `apt.ubuntu.com`.
+
 ```mermaid
 sequenceDiagram
-    participant DB as 🗄️ DB Server<br/>(10.0.2.50)
-    participant PrivRT as 📋 Private Route Table
-    participant NAT as 🔄 NAT Gateway<br/>(EIP: 15.206.x.x)
-    participant PubRT as 📋 Public Route Table
-    participant IGW as 🚪 Internet Gateway
-    participant Apt as 📦 apt.ubuntu.com
+    participant DB as DB Server (10.0.2.50)
+    participant NAT as NAT Gateway (15.206.x.x)
+    participant IGW as Internet Gateway
+    participant Apt as apt.ubuntu.com
 
-    Note over DB,Apt: ═══ OUTBOUND: Private Instance → Internet ═══
+    Note over DB,Apt: OUTBOUND
+    DB->>NAT: src=10.0.2.50, dst=apt.ubuntu.com
+    Note over NAT: SNAT: src becomes 15.206.x.x
+    NAT->>IGW: src=15.206.x.x, dst=apt.ubuntu.com
+    IGW->>Apt: Packet reaches internet
 
-    DB->>PrivRT: ① Packet: src=10.0.2.50, dst=apt.ubuntu.com
-    Note over PrivRT: ② Route lookup:<br/>0.0.0.0/0 → NAT Gateway
-    PrivRT->>NAT: ③ Forward to NAT Gateway
-
-    Note over NAT: ④ SNAT (Source NAT):<br/>Replace source IP<br/>10.0.2.50 → 15.206.x.x (EIP)<br/>Store in connection tracking table
-
-    NAT->>PubRT: ⑤ Packet: src=15.206.x.x, dst=apt.ubuntu.com
-    Note over PubRT: ⑥ Route lookup:<br/>0.0.0.0/0 → IGW
-    PubRT->>IGW: ⑦ Forward to IGW
-    IGW->>Apt: ⑧ Packet reaches internet
-
-    Note over DB,Apt: ═══ RETURN: Internet → Private Instance ═══
-
-    Apt->>IGW: ⑨ Response: src=apt.ubuntu.com, dst=15.206.x.x
-    IGW->>NAT: ⑩ Routes to NAT (EIP owner)
-
-    Note over NAT: ⑪ DNAT (Destination NAT):<br/>Lookup connection table<br/>Replace dest IP<br/>15.206.x.x → 10.0.2.50
-
-    NAT->>PrivRT: ⑫ Packet: src=apt.ubuntu.com, dst=10.0.2.50
-    PrivRT->>DB: ⑬ Delivered to DB Server
-
-    Note over DB,Apt: ═══ ❌ BLOCKED: Internet → Private Instance ═══
-    Apt--xDB: ❌ Cannot initiate inbound connection!
+    Note over DB,Apt: RETURN
+    Apt->>IGW: Response to 15.206.x.x
+    IGW->>NAT: Deliver to EIP owner
+    Note over NAT: DNAT: dst becomes 10.0.2.50
+    NAT->>DB: Package data delivered!
 ```
+
+**Explaining each step in plain language:**
+
+1. **DB Server sends a packet.** The DB server wants to download packages. It creates a packet with source `10.0.2.50` (its own IP) and destination `apt.ubuntu.com`. The private route table says: "anything not in `10.0.0.0/16`, send to NAT Gateway."
+
+2. **NAT Gateway performs SNAT (Source NAT).** The NAT Gateway receives the packet and does the key translation: it **replaces the source IP** from `10.0.2.50` to its own Elastic IP `15.206.x.x`. It saves a record of this swap in its connection tracking table so it can undo it later.
+
+3. **Packet goes through IGW to the internet.** Since the NAT Gateway is in the public subnet (which has `0.0.0.0/0 → IGW` in its route table), the packet flows to the Internet Gateway and exits AWS.
+
+4. **Ubuntu servers respond.** Ubuntu's package server processes the request and sends the response back to `15.206.x.x` — it has no idea `10.0.2.50` exists.
+
+5. **IGW routes the reply to NAT.** The Internet Gateway knows `15.206.x.x` belongs to the NAT Gateway, so it delivers the packet there.
+
+6. **NAT Gateway performs DNAT (Destination NAT).** NAT looks up its connection tracking table: "port 43210 → belongs to 10.0.2.50". It **replaces the destination IP** from `15.206.x.x` back to `10.0.2.50` and delivers the packet to the DB server.
 
 ### SNAT vs DNAT Explained
 
+NAT Gateway performs **two types of address translation**:
+
 ```mermaid
 graph LR
-    subgraph SNAT["SNAT (Source NAT) - Outbound"]
-        S1["Original: src=10.0.2.50"] -->|"NAT translates"| S2["Translated: src=15.206.x.x"]
-    end
+    A["src: 10.0.2.50"] -->|"SNAT"| B["src: 15.206.x.x"]
+    C["dst: 15.206.x.x"] -->|"DNAT"| D["dst: 10.0.2.50"]
 
-    subgraph DNAT["DNAT (Destination NAT) - Return"]
-        D1["Original: dst=15.206.x.x"] -->|"NAT translates"| D2["Translated: dst=10.0.2.50"]
-    end
-
-    style SNAT fill:#e3f2fd
-    style DNAT fill:#fce4ec
+    style A fill:#e3f2fd
+    style B fill:#e3f2fd
+    style C fill:#fce4ec
+    style D fill:#fce4ec
 ```
+
+- **SNAT (Source NAT)** — happens on the way OUT. The private source IP gets replaced with the NAT Gateway's public Elastic IP. This makes the packet routable on the internet.
+- **DNAT (Destination NAT)** — happens on the way BACK. The NAT Gateway's public IP (which was the destination in the reply) gets replaced with the original private IP. This delivers the response to the correct instance.
 
 ---
 
@@ -344,71 +342,48 @@ Your database server (`10.0.2.50`) is in a private subnet. It needs to run `sudo
 
 ```mermaid
 sequenceDiagram
-    participant Admin as 👨‍💻 Admin<br/>(via Bastion/SSM)
-    participant DB as 🗄️ DB Server<br/>Private Subnet<br/>(10.0.2.50)<br/>❌ No Public IP
-    participant PrivRT as 📋 Private Route Table
-    participant NAT as 🔄 NAT Gateway<br/>Public Subnet<br/>(EIP: 15.206.x.x)
-    participant PubRT as 📋 Public Route Table
-    participant IGW as 🚪 Internet Gateway
-    participant Apt as 📦 archive.ubuntu.com
+    participant Admin as Admin (Bastion)
+    participant DB as DB Server (10.0.2.50)
+    participant NAT as NAT GW (15.206.x.x)
+    participant IGW as IGW
+    participant Apt as Ubuntu Repos
 
-    Admin->>DB: ssh → run: sudo apt-get update
-
-    Note over DB: DNS resolves archive.ubuntu.com<br/>to 91.189.91.39
-
-    rect rgb(230, 245, 255)
-    Note over DB,Apt: OUTBOUND JOURNEY (Private → Internet)
-    DB->>PrivRT: ① Packet: src=10.0.2.50 dst=91.189.91.39
-    Note over PrivRT: ② Route lookup:<br/>91.189.91.39 not in 10.0.0.0/16<br/>→ 0.0.0.0/0 → nat-gw-xxx
-    PrivRT->>NAT: ③ Forward to NAT Gateway
-    Note over NAT: ④ Source NAT translation:<br/>src: 10.0.2.50 → 15.206.x.x<br/>Save mapping in connection table:<br/>{10.0.2.50:43210 ↔ 15.206.x.x:43210}
-    NAT->>PubRT: ⑤ Packet: src=15.206.x.x dst=91.189.91.39
-    Note over PubRT: ⑥ Route: 0.0.0.0/0 → IGW
-    PubRT->>IGW: ⑦ Forward to IGW
-    Note over IGW: ⑧ 1:1 NAT for NAT GW's ENI
-    IGW->>Apt: ⑨ Packet reaches Ubuntu servers
-    end
-
-    rect rgb(255, 240, 230)
-    Note over DB,Apt: RETURN JOURNEY (Internet → Private)
-    Apt->>IGW: ⑩ Response: src=91.189.91.39 dst=15.206.x.x
-    IGW->>NAT: ⑪ Deliver to NAT GW (EIP owner)
-    Note over NAT: ⑫ Reverse lookup connection table:<br/>{15.206.x.x:43210 → 10.0.2.50:43210}<br/>dst: 15.206.x.x → 10.0.2.50
-    NAT->>PrivRT: ⑬ Packet: src=91.189.91.39 dst=10.0.2.50
-    PrivRT->>DB: ⑭ Delivered! Package list received ✅
-    end
-
-    Note over DB: apt-get update succeeded!<br/>Now runs apt-get upgrade...
+    Admin->>DB: ssh: sudo apt-get update
+    DB->>NAT: src=10.0.2.50
+    Note over NAT: SNAT: src=15.206.x.x
+    NAT->>IGW: Forward
+    IGW->>Apt: Request to 91.189.91.39
+    Apt->>IGW: Package list response
+    IGW->>NAT: Reply to 15.206.x.x
+    Note over NAT: DNAT: dst=10.0.2.50
+    NAT->>DB: Packages received!
+    DB->>Admin: apt-get update complete
 ```
 
-### The Key Insight: 4 IP Translations in One Request
+**What happens at each step:**
 
-A single `apt-get update` packet goes through **4 address translations**:
+1. **Admin connects to DB server** through a bastion host or AWS SSM (you can't SSH directly from the internet to a private instance)
+2. **Admin runs `sudo apt-get update`** on the DB server
+3. **DB server resolves DNS** — `archive.ubuntu.com` resolves to `91.189.91.39`
+4. **DB server sends packet** — source is `10.0.2.50`, destination is `91.189.91.39`
+5. **Private route table** finds `0.0.0.0/0 → NAT Gateway` and forwards the packet
+6. **NAT Gateway (SNAT)** replaces source `10.0.2.50` with its Elastic IP `15.206.x.x` and records the mapping
+7. **Packet flows through Public Route Table → IGW → Internet** to Ubuntu's servers
+8. **Ubuntu responds** to `15.206.x.x` with the package list
+9. **Reply comes back through IGW → NAT Gateway**
+10. **NAT Gateway (DNAT)** looks up the mapping, replaces destination `15.206.x.x` back to `10.0.2.50`
+11. **DB server receives the response** — `apt-get update` succeeded!
 
-```mermaid
-graph LR
-    subgraph Step1["① DB Server sends"]
-        A1["src: 10.0.2.50\ndst: 91.189.91.39"]
-    end
-    subgraph Step2["④ NAT Gateway translates"]
-        A2["src: 15.206.x.x\ndst: 91.189.91.39"]
-    end
-    subgraph Step3["⑩ Ubuntu responds"]
-        A3["src: 91.189.91.39\ndst: 15.206.x.x"]
-    end
-    subgraph Step4["⑫ NAT Gateway reverse translates"]
-        A4["src: 91.189.91.39\ndst: 10.0.2.50"]
-    end
+The entire time, Ubuntu's servers only ever communicated with `15.206.x.x`. They have **zero knowledge** that `10.0.2.50` exists.
 
-    A1 -->|"SNAT"| A2
-    A2 -->|"Internet"| A3
-    A3 -->|"DNAT"| A4
+### The Key Insight: IP Translations
 
-    style Step1 fill:#dd3522,color:#fff
-    style Step2 fill:#3b48cc,color:#fff
-    style Step3 fill:#1a8f1a,color:#fff
-    style Step4 fill:#dd3522,color:#fff
-```
+A single `apt-get update` goes through **two translations** — SNAT on the way out, DNAT on the way back:
+
+| Direction | Before NAT | After NAT | What Changed |
+|-----------|-----------|-----------|-------------|
+| **Outbound** (SNAT) | src=`10.0.2.50` | src=`15.206.x.x` | Source IP replaced with EIP |
+| **Return** (DNAT) | dst=`15.206.x.x` | dst=`10.0.2.50` | Destination IP restored to private IP |
 
 > **The internet (Ubuntu servers) never sees `10.0.2.50`.** It only communicates with `15.206.x.x` (the NAT Gateway's Elastic IP). This is why private instances are protected — they are invisible to the internet.
 
@@ -430,21 +405,15 @@ graph LR
 
 ### What If There Is No NAT Gateway?
 
+If the private route table has **no** `0.0.0.0/0` route (or no NAT Gateway), packets to the internet simply get dropped:
+
 ```mermaid
-graph TB
-    subgraph Without_NAT["❌ Private Subnet WITHOUT NAT Gateway"]
-        DB2["🗄️ DB Server\n10.0.2.50"]
-        PrivRT2["📋 Private Route Table\n10.0.0.0/16 → local\n(no other routes!)"]
-    end
+graph LR
+    DB2["DB Server\n10.0.2.50"] --> RT2["Private RT\nOnly: 10.0.0.0/16 → local"]
+    RT2 --> X["❌ No route!\nPacket dropped"]
 
-    DB2 -->|"apt-get update\nsrc=10.0.2.50\ndst=91.189.91.39"| PrivRT2
-    PrivRT2 -->|"❌ No matching route!\n91.189.91.39 not in 10.0.0.0/16\nPacket DROPPED"| Nowhere["🕳️ Packet dropped\nConnection timed out"]
-
-    DB2 -.-|"❌ Cannot resolve DNS"| DNS2["DNS"]
-    DB2 -.-|"❌ Cannot download anything"| Internet2["Internet"]
-
-    style Without_NAT fill:#ffebee
-    style Nowhere fill:#dd3522,color:#fff
+    style DB2 fill:#dd3522,color:#fff
+    style X fill:#ffcdd2
 ```
 
 Without a NAT Gateway (and no other internet path):
@@ -462,48 +431,52 @@ Here's how IGW and NAT Gateway work **together** to serve both public and privat
 
 ```mermaid
 graph TB
-    Internet["🌐 Internet\n(Package repos, APIs, etc.)"]
-    IGW["🚪 Internet Gateway\nFREE | Bidirectional | 1:1 NAT"]
+    Internet["🌐 Internet"]
+    IGW["Internet Gateway"]
 
-    subgraph VPC["🏗️ VPC (10.0.0.0/16)"]
-        subgraph Public["🟢 Public Subnet (10.0.1.0/24)"]
-            WebServer["💻 Web Server\n10.0.1.5 / 3.110.x.x"]
-            NAT["🔄 NAT Gateway\nEIP: 15.206.x.x"]
+    subgraph VPC["VPC (10.0.0.0/16)"]
+        subgraph Public["Public Subnet"]
+            Web["Web Server\n10.0.1.5"]
+            NAT["NAT GW\n15.206.x.x"]
         end
 
-        subgraph Private["🔴 Private Subnet (10.0.2.0/24)"]
-            AppServer["⚙️ App Server\n10.0.2.100"]
-            DBServer["🗄️ DB Server\n10.0.2.50"]
+        subgraph Private["Private Subnet"]
+            App["App Server\n10.0.2.100"]
+            DB["DB Server\n10.0.2.50"]
         end
-
-        PubRT["📋 Public RT\n10.0.0.0/16 → local\n0.0.0.0/0 → IGW"]
-        PrivRT["📋 Private RT\n10.0.0.0/16 → local\n0.0.0.0/0 → NAT GW"]
     end
 
-    Internet <-->|"Users access website"| IGW
-    IGW <--> PubRT
-    PubRT --> WebServer
-    PubRT --> NAT
-
-    AppServer -->|"pip install / API calls"| PrivRT
-    DBServer -->|"apt-get update"| PrivRT
-    PrivRT -->|"Outbound via NAT"| NAT
-    NAT -->|"Then via IGW"| IGW
-
-    Internet --x|"❌ Cannot reach\nprivate instances"| Private
+    Internet <--> IGW
+    IGW <--> Web
+    App --> NAT --> IGW
+    DB --> NAT
+    Internet --x|"❌ Blocked"| Private
 
     style IGW fill:#ff9900,color:#000
     style NAT fill:#3b48cc,color:#fff
-    style Public fill:#1a8f1a,color:#fff
-    style Private fill:#dd3522,color:#fff
-    style VPC fill:#232f3e,color:#fff
+    style Public fill:#c8e6c9
+    style Private fill:#ffcdd2
 ```
 
-**Summary of the path for a private instance to download software:**
+**Two different paths based on subnet type:**
+
+| Path | How It Works | Direction |
+|------|-------------|----------|
+| **Web Server (public)** | Web Server ↔ IGW ↔ Internet | ↔ Bidirectional |
+| **DB/App Server (private)** | DB/App → NAT GW → IGW → Internet | → Outbound only |
+
+**The full path for a private instance to download software:**
 
 ```
-Private Instance → Private Route Table → NAT Gateway → Public Route Table → IGW → Internet
-     (10.0.2.50)    (0.0.0.0/0→NAT)     (SNAT to EIP)   (0.0.0.0/0→IGW)   (to world)
+DB Server → Private Route Table → NAT Gateway → Public Route Table → IGW → Internet
+(10.0.2.50)  (0.0.0.0/0→NAT)     (SNAT to EIP)  (0.0.0.0/0→IGW)    (to world)
+```
+
+**The return path:**
+
+```
+Internet → IGW → NAT Gateway → DB Server
+           (to EIP)  (DNAT back to 10.0.2.50)  (packet delivered!)
 ```
 
 ---
@@ -525,45 +498,51 @@ Private Instance → Private Route Table → NAT Gateway → Public Route Table 
 
 ## Elastic IP (EIP) — Why NAT Needs It
 
+The NAT Gateway needs an Elastic IP so that the internet has a **consistent address** to send responses back to. Without it, return traffic would have nowhere to go.
+
 ```mermaid
-graph TD
-    subgraph EIP_Explained["Elastic IP (EIP)"]
-        A["What: Static public IPv4 address"]
-        B["Why NAT needs it: NAT must have a<br/>consistent public IP for return traffic"]
-        C["Cost: FREE when attached & in use<br/>$0.005/hr when NOT attached"]
-        D["Limit: 5 per region (can request more)"]
-    end
+graph LR
+    EIP["EIP: 15.206.x.x"] --> NAT2["NAT Gateway"]
+    NAT2 --> Internet2["Internet sees\n15.206.x.x"]
 
-    EIP["EIP: 15.206.x.x"] -->|"Attached to"| NAT2["NAT Gateway"]
-    NAT2 -->|"All outbound traffic<br/>uses this IP"| Internet2["Internet sees 15.206.x.x"]
-
-    style EIP_Explained fill:#fff3e0
     style EIP fill:#ff9900,color:#000
+    style NAT2 fill:#3b48cc,color:#fff
 ```
+
+**Elastic IP key facts:**
+
+| Property | Detail |
+|----------|--------|
+| **What** | A static public IPv4 address that doesn't change |
+| **Why NAT needs it** | NAT must have a fixed public IP so return traffic can find it |
+| **Cost** | FREE when attached to a running NAT GW. $0.005/hr if NOT attached |
+| **Limit** | 5 per region (you can request more from AWS) |
 
 ---
 
 ## Key Rule: NAT Gateway Goes in PUBLIC Subnet
 
-This is the most common mistake. The NAT Gateway MUST be in a **public subnet** because:
+This is the most common mistake. The NAT Gateway MUST be in a **public subnet** because it needs the IGW route to reach the internet.
 
 ```mermaid
-graph TD
-    Q["Why must NAT be in PUBLIC subnet?"]
-    Q --> A["NAT needs to reach the internet"]
-    Q --> B["Public subnet has route to IGW"]
-    Q --> C["NAT forwards traffic through IGW"]
+graph LR
+    subgraph Right["✅ CORRECT"]
+        NAT_R["NAT GW"] --> PubRT_R["Public RT\n0.0.0.0/0 → IGW"] --> IGW_R["IGW"] --> Net_R["Internet"]
+    end
 
-    A --> R["NAT → Public Subnet Route Table → IGW → Internet"]
+    subgraph Wrong["❌ WRONG"]
+        NAT_W["NAT GW"] --> PrivRT_W["Private RT\nNo IGW route!"] --> X["❌ Dead end"]
+    end
 
-    Wrong["❌ WRONG: NAT in private subnet"]
-    Wrong --> W1["Private subnet has no IGW route"]
-    Wrong --> W2["NAT can't reach the internet"]
-    Wrong --> W3["Nothing works!"]
-
-    style Q fill:#ff9900,color:#000
-    style Wrong fill:#dd3522,color:#fff
+    style Right fill:#c8e6c9
+    style Wrong fill:#ffcdd2
 ```
+
+If you put the NAT Gateway in a private subnet:
+- The private subnet's route table has **no route to the IGW**
+- NAT Gateway receives packets from your instances, but **can't forward them to the internet**
+- Everything fails silently — packets just get dropped
+- **Always place NAT Gateway in the PUBLIC subnet**
 
 ---
 
@@ -596,88 +575,68 @@ Total:                        ≈ $35.10/month
 
 ## High Availability Setup
 
-If an AZ goes down, its NAT Gateway goes down too. Deploy one per AZ:
+If an AZ goes down, its NAT Gateway goes down too. For production, deploy one NAT Gateway per AZ so each AZ is independent:
 
 ```mermaid
 graph TB
-    Internet["🌐 Internet"]
-    IGW["🚪 IGW"]
+    Internet["🌐 Internet"] <--> IGW["IGW"]
 
-    subgraph VPC["VPC"]
-        subgraph AZ_A["AZ-A"]
-            PubA["Public Subnet A"]
-            NAT_A["🔄 NAT GW A + EIP A"]
-            PrivA["Private Subnet A"]
-        end
-
-        subgraph AZ_B["AZ-B"]
-            PubB["Public Subnet B"]
-            NAT_B["🔄 NAT GW B + EIP B"]
-            PrivB["Private Subnet B"]
-        end
-
-        PrivRTA["Private RT-A<br/>0.0.0.0/0 → NAT A"]
-        PrivRTB["Private RT-B<br/>0.0.0.0/0 → NAT B"]
+    subgraph AZ_A["AZ-A"]
+        NAT_A["NAT GW A"] 
+        PrivA["Private Subnet A"]
+        PrivA --> NAT_A
     end
 
-    Internet <--> IGW
-    IGW --> PubA & PubB
-    PubA --> NAT_A
-    PubB --> NAT_B
-    PrivA -->|"Same AZ = no cross-AZ cost"| PrivRTA --> NAT_A
-    PrivB -->|"Same AZ = no cross-AZ cost"| PrivRTB --> NAT_B
+    subgraph AZ_B["AZ-B"]
+        NAT_B["NAT GW B"]
+        PrivB["Private Subnet B"]
+        PrivB --> NAT_B
+    end
+
+    NAT_A --> IGW
+    NAT_B --> IGW
 
     style NAT_A fill:#3b48cc,color:#fff
     style NAT_B fill:#3b48cc,color:#fff
     style IGW fill:#ff9900,color:#000
 ```
 
-> **Cost tip:** Cross-AZ data transfer costs $0.01/GB. Keeping NAT in the same AZ as private subnets avoids this.
+Each private subnet routes `0.0.0.0/0` to the NAT Gateway **in the same AZ**. This way:
+- If AZ-A goes down, AZ-B's NAT Gateway keeps working independently
+- Traffic stays within the same AZ, avoiding cross-AZ data transfer charges ($0.01/GB)
 
 ---
 
 ## IGW vs NAT Gateway Comparison
 
-```mermaid
-graph LR
-    subgraph IGW_Box["🚪 Internet Gateway"]
-        I1["Direction: ↕️ Bidirectional"]
-        I2["Cost: 💚 FREE"]
-        I3["Used by: Public subnets"]
-        I4["NAT type: 1:1 (Public↔Private)"]
-        I5["Limit: 1 per VPC"]
-    end
-
-    subgraph NAT_Box["🔄 NAT Gateway"]
-        N1["Direction: ⬆️ Outbound only"]
-        N2["Cost: 💰 ~$35/month"]
-        N3["Used by: Private subnets"]
-        N4["NAT type: Many:1 (PAT)"]
-        N5["Limit: Per AZ recommended"]
-    end
-
-    style IGW_Box fill:#ff9900,color:#000
-    style NAT_Box fill:#3b48cc,color:#fff
-```
+| Feature | Internet Gateway | NAT Gateway |
+|---------|-----------------|-------------|
+| **Direction** | Bidirectional (in + out) | Outbound only |
+| **Cost** | FREE | ~$35/month |
+| **Used by** | Public subnets | Private subnets |
+| **NAT type** | 1:1 (one public IP per instance) | Many:1 / PAT (many instances share one IP) |
+| **Limit** | 1 per VPC | 1 per AZ recommended |
+| **Requires** | VPC attachment | Elastic IP + public subnet placement |
 
 ### When to Use What?
 
 ```mermaid
 flowchart TD
-    A["Does the resource need to<br/>be reached FROM the internet?"]
-    A -->|"Yes"| B["✅ Public Subnet + IGW"]
-    A -->|"No"| C{"Does it need outbound<br/>internet access?"}
-    C -->|"Yes"| D["✅ Private Subnet + NAT GW"]
-    C -->|"No"| E["✅ Private Subnet<br/>(fully isolated)"]
-
-    B --> F["Web servers, ALBs,<br/>Bastion hosts"]
-    D --> G["DB needing updates,<br/>App calling APIs"]
-    E --> H["Sensitive databases,<br/>Compliance workloads"]
+    A{"Need inbound access\nfrom internet?"}
+    A -->|Yes| B["✅ Public Subnet + IGW"]
+    A -->|No| C{"Need outbound access\nto internet?"}
+    C -->|Yes| D["✅ Private Subnet + NAT GW"]
+    C -->|No| E["✅ Private Subnet\nfully isolated"]
 
     style B fill:#1a8f1a,color:#fff
     style D fill:#3b48cc,color:#fff
     style E fill:#dd3522,color:#fff
 ```
+
+**Examples:**
+- **Public Subnet + IGW** → Web servers, load balancers, bastion hosts
+- **Private Subnet + NAT GW** → Database servers needing updates, app servers calling APIs
+- **Private Subnet (isolated)** → Sensitive databases, compliance workloads
 
 ---
 
