@@ -135,6 +135,118 @@ graph TD
 
 ---
 
+## Why Do We Need an Internet Gateway?
+
+Without an IGW, your VPC is a **completely isolated network**. Think of it like building a house with no doors — you have rooms (subnets) and hallways (route tables), but nothing connects to the outside world.
+
+### What Happens Without an IGW?
+
+```mermaid
+graph TB
+    Internet["🌐 Internet"]
+
+    subgraph VPC_No_IGW["VPC WITHOUT Internet Gateway"]
+        EC2_1["💻 EC2 Instance\n10.0.1.5"]
+        EC2_2["💻 EC2 Instance\n10.0.1.10"]
+
+        EC2_1 <-->|"✅ Internal traffic works\n(local route)"| EC2_2
+    end
+
+    EC2_1 --x|"❌ apt-get update FAILS"| Internet
+    EC2_1 --x|"❌ pip install FAILS"| Internet
+    EC2_1 --x|"❌ curl google.com FAILS"| Internet
+    Internet --x|"❌ SSH to instance FAILS"| EC2_1
+
+    style VPC_No_IGW fill:#dd3522,color:#fff
+    style Internet fill:#232f3e,color:#fff
+```
+
+**Without IGW, you CANNOT:**
+- SSH into any instance (even with a public IP)
+- Run `apt-get update`, `yum install`, or `pip install` on any instance
+- Access any external API, download any file, or reach any website
+- Pull Docker images from Docker Hub or ECR public
+
+**Without IGW, you CAN still:**
+- Communicate between instances inside the same VPC (local route always works)
+- Access AWS services via VPC Endpoints (private links, no internet needed)
+- Connect to on-premises networks via VPN or Direct Connect
+
+---
+
+## Can a Private Subnet Instance Use the IGW Directly?
+
+**NO.** This is a critical concept. Even though the IGW is attached to the VPC, a private subnet instance **cannot** use it because:
+
+```mermaid
+graph TB
+    subgraph VPC["VPC"]
+        IGW["🚪 IGW"]
+
+        subgraph Pub["🟢 Public Subnet"]
+            PubEC2["💻 Web Server\n10.0.1.5\nPublic IP: 3.110.x.x"]
+        end
+
+        subgraph Priv["🔴 Private Subnet"]
+            PrivEC2["💻 DB Server\n10.0.2.50\nNo Public IP"]
+        end
+
+        PubRT["📋 Public RT\n0.0.0.0/0 → IGW ✅"]
+        PrivRT["📋 Private RT\n0.0.0.0/0 → ??? ❌\n(no route to IGW)"]
+    end
+
+    PubEC2 -->|"✅ Has route + public IP"| PubRT --> IGW
+    PrivEC2 -->|"❌ No route to IGW"| PrivRT
+    PrivRT -.-x|"Dead end\nPacket dropped"| IGW
+
+    style Pub fill:#1a8f1a,color:#fff
+    style Priv fill:#dd3522,color:#fff
+    style IGW fill:#ff9900,color:#000
+```
+
+### Two reasons private instances can't use IGW:
+
+| # | Reason | Explanation |
+|---|--------|-------------|
+| 1 | **No route** | The private subnet's route table has no `0.0.0.0/0 → igw` entry. Outbound packets have nowhere to go. |
+| 2 | **No public IP** | Even if you added an IGW route, the IGW performs 1:1 NAT. It needs a public IP mapped to the private IP. Private instances typically have no public IP. |
+
+> **So how does a private instance reach the internet?** That's exactly what a **NAT Gateway** solves — see [05-nat-gateway](../05-nat-gateway/).
+
+---
+
+## Real-World Traffic Example: Public Instance Downloading Software
+
+When an EC2 instance in a **public subnet** runs `sudo apt-get update`, here's the full journey:
+
+```mermaid
+sequenceDiagram
+    participant EC2 as 💻 EC2 in Public Subnet<br/>(Private: 10.0.1.5)<br/>(Public: 3.110.45.67)
+    participant RT as 📋 Public Route Table
+    participant IGW as 🚪 Internet Gateway
+    participant DNS as 🔍 DNS Server
+    participant Apt as 📦 archive.ubuntu.com<br/>(91.189.91.39)
+
+    EC2->>DNS: Step 1: Resolve archive.ubuntu.com
+    DNS-->>EC2: 91.189.91.39
+
+    EC2->>RT: Step 2: Send packet to 91.189.91.39
+    Note over RT: Route lookup:<br/>91.189.91.39 not in 10.0.0.0/16<br/>→ matches 0.0.0.0/0 → IGW
+    RT->>IGW: Step 3: Forward to IGW
+
+    Note over IGW: Step 4: NAT Translation<br/>src: 10.0.1.5 → 3.110.45.67
+    IGW->>Apt: Step 5: Packet leaves AWS<br/>src=3.110.45.67, dst=91.189.91.39
+
+    Apt->>IGW: Step 6: Response to 3.110.45.67
+    Note over IGW: Step 7: Reverse NAT<br/>dst: 3.110.45.67 → 10.0.1.5
+    IGW->>RT: Step 8: Deliver to VPC
+    RT->>EC2: Step 9: Package list received! ✅
+
+    Note over EC2: apt-get update succeeded!
+```
+
+---
+
 ## Module Dependencies
 
 ```mermaid
